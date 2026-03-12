@@ -1,0 +1,47 @@
+#!/bin/bash
+
+echo "=== 基线核查报告 ==="
+echo "操作系统: $(cat /etc/os-release | grep PRETTY_NAME | cut -d'=' -f2)"
+echo "内核版本: $(uname -r)"
+echo "更新时间: $(date)"
+
+# 检查系统更新
+echo -e "\n[1] 检查系统更新..."
+if command -v apt &> /dev/null; then
+    apt list --upgradable | grep -i upgradable
+else
+    echo "未检测到 apt 包管理器"
+fi
+
+# 检查防火墙状态
+echo -e "\n[2] 检查防火墙状态..."
+if command -v ufw &> /dev/null; then
+    ufw status
+else
+    echo "ufw 未安装"
+fi
+
+# 检查 SSH 配置
+echo -e "\n[3] SSH 配置检查..."
+if [ -f /etc/ssh/sshd_config ]; then
+    echo "PermitRootLogin: $(grep -i PermitRootLogin /etc/ssh/sshd_config | tail -1 | awk '{print $2}')"
+    echo "PasswordAuthentication: $(grep -i PasswordAuthentication /etc/ssh/sshd_config | tail -1 | awk '{print $2}')"
+else
+    echo "未找到 /etc/ssh/sshd_config"
+fi
+
+# 检查 sudo 权限
+echo -e "\n[4] sudo 权限检查..."
+if [ -f /etc/sudoers ]; then
+    echo "以下行来自 sudoers："
+    grep -E "^%sudo|^%admin" /etc/sudoers || echo "未发现明显的 sudo 组配置"
+else
+    echo "未找到 /etc/sudoers"
+fi
+
+# 列出 UID 为 0 的用户
+echo -e "\n[5] 检查 root 用户（UID=0）..."
+echo "UID=0 用户列表："
+awk -F: '$3==0 {print $1}' /etc/passwd
+
+echo -e "\n=== 基线核查完成 ==="
