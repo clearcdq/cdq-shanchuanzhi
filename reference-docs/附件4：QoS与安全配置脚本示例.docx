@@ -1,0 +1,380 @@
+# 附件4：QoS与安全配置脚本示例（H3C Comware V7）
+
+## 4.1 脚本说明
+
+本配置文件适用于H3C S6800系列交换机，实现：
+- VLAN划分与接口分配
+- QoS策略（PACS流量优先）
+- 端口安全（MAC绑定+802.1X）
+- 链路聚合（LACP）
+- 监控与告警
+
+**注意：** 以下为模板，实际配置需根据现场IP规划、VLAN编号调整。
+
+---
+
+## 4.2 系统基础配置
+
+```text
+#
+# 设备基本信息
+#
+sysname RAD-Dept-Switch-01
+description Access Switch for Radiology Department (New Campus)
+#
+# 管理VLAN
+#
+vlan 99
+ name Management
+#
+interface Vlan-interface 99
+ ip address 10.10.99.11 255.255.255.0
+ description Management VLAN
+#
+# 默认路由（指向核心交换机）
+#
+ip route-static 0.0.0.0 0.0.0.0 10.10.99.1
+#
+# SNMP配置（便于网管系统监控）
+#
+snmp-agent sys-info version v2c
+snmp-agent community read public
+snmp-agent community write private
+snmp-agent trap enable
+#
+# 时钟同步
+#
+ntp-service unicast-server 10.10.99.100
+```
+
+---
+
+## 4.3 VLAN与接口配置
+
+```text
+#
+# 创建业务VLAN
+#
+vlan 10
+ name PACS-Servers
+vlan 20
+ name Radiology-New
+vlan 30
+ name Radiology-Old
+#
+# 万兆上行接口配置（连接核心交换机）
+#
+interface Ten-GigabitEthernet1/0/1
+ description uplink-to-core-sw1
+ port link-type trunk
+ port trunk permit vlan 10 20 30 99
+#
+interface Ten-GigabitEthernet1/0/2
+ description uplink-to-core-sw2 (LACP)
+ port link-type trunk
+ port trunk permit vlan 10 20 30 99
+#
+# 接入端口配置（连接工作站）
+#
+# 示例：端口1-24为工作站端口，划分到对应VLAN
+#
+interface GigabitEthernet1/0/1
+ description WS-New-01
+ port access vlan 20
+ port link auto    # 自动协商
+ port speed auto   # 自适应速率
+ qos apply peds-policy outbound  # 应用QoS策略
+#
+interface GigabitEthernet1/0/2
+ description WS-New-02
+ port access vlan 20
+ port link auto
+ port speed auto
+ qos apply peds-policy outbound
+#
+# ... 重复配置其他端口，建议批量配置
+#
+interface range GigabitEthernet1/0/1 to GigabitEthernet1/0/24
+ port access vlan 20  # 根据端口用途改为20或30
+ port link auto
+ port speed auto
+ qos apply peds-policy outbound
+ stp edge-port     # 边缘端口，不参与生成树
+#
+```
+
+---
+
+## 4.4 链路聚合（LACP）配置
+
+```text
+#
+# 上行双链路聚合，提高带宽和冗余
+#
+interface Bridge-Aggregation 1
+ description aggregate-uplink-to-core
+ port link-type trunk
+ port trunk permit vlan 10 20 30 99
+ link-aggregation mode dynamic    # LACP动态聚合
+#
+# 将物理接口加入聚合组
+#
+interface Ten-GigabitEthernet1/0/1
+ port link-aggregation group 1
+#
+interface Ten-GigabitEthernet1/0/2
+ port link-aggregation group 1
+#
+# 验证聚合状态
+#
+display link-aggregation summary
+```
+
+---
+
+## 4.5 QoS策略配置
+
+### 4.5.1 定义ACL匹配流量类型
+
+```text
+#
+# 定义PACS流量ACL（基于端口和DSCP）
+#
+acl number 3000
+ rule 5 permit tcp destination-port eq 104  # DICOM标准端口
+ rule 10 permit tcp destination-port eq 11112  # PACS常用端口
+ rule 15 permit tcp destination-port eq 5000  # PACS传输端口
+#
+# 如果PACS使用特定网段，可定义基于IP的ACL
+#
+acl number 3001
+ rule 5 permit ip source 10.10.20.0 0.0.0.255 destination 10.10.1.0 0.0.0.255  # 新院区→PACS
+ rule 10 permit ip source 10.10.30.0 0.0.0.255 destination 10.10.1.0 0.0.0.255  # 老院区→PACS
+```
+
+### 4.5.2 定义流量分类器（Classifier）
+
+```text
+#
+# 将DICOM流量分类为"pacs-traffic"
+#
+traffic classifier peds-pacs
+ if-match acl 3000
+#
+# 同时匹配DSCP标记（如果服务器已标记）
+traffic classifier dscp-pacs
+ if-match dscp ef  # DSCP值46， Expedited Forwarding
+```
+
+### 4.5.3 定义流量行为（Behavior）
+
+```text
+#
+# PACS流量：最高优先级（EF）
+#
+traffic behavior peds-highpriority
+ remark dscp ef  # 标记DSCP为EF
+ priority high   # 队列优先级最高
+#
+# 视频会诊流量：AF41
+#
+traffic behavior video-h priority af41
+#
+# 办公流量：默认BE
+#
+traffic behavior office-default
+ remark dscp be
+ priority low
+```
+
+### 4.5.4 绑定分类器与行为（QoS策略）
+
+```text
+#
+# 入方向策略：对进入的流量分类并标记
+#
+qos policy peds-ingress
+ classifier peds-pacs behavior peds-highpriority
+ classifier dscp-pacs behavior peds-highpriority
+ classifier default behavior office-default
+#
+# 出方向策略：对发出的流量调度
+#
+qos policy peds-egress
+ classifier peds-pacs behavior peds-highpriority
+ classifier dscp-pacs behavior peds-highpriority
+ classifier video-af41 behavior video-h priority
+ classifier default behavior office-default
+#
+# 应用策略到接口
+#
+interface GigabitEthernet1/0/1  # 接入端口
+ qos apply peds-ingress inbound
+ qos apply peds-egress outbound
+#
+interface Ten-GigabitEthernet1/0/1  # 上行端口
+ qos apply peds-egress outbound
+#
+```
+
+### 4.5.5 队列调度配置
+
+```text
+#
+# 全局QoS调度配置
+#
+qos queue-profile default
+ queue 0 dws 100  # 最高优先级队列（EF）
+ queue 1 dws 50   # 高优先级（AF41/AF31）
+ queue 2 dws 20   # 中优先级（AF21）
+ queue 3 dws 10   # 低优先级（BE）
+#
+# 带宽保障（为PACS预留50%骨干带宽）
+#
+interface Ten-GigabitEthernet1/0/1
+ qos queue guaranteed-bandwidth 5000  # 预留5000Mbps
+```
+
+---
+
+## 4.6 端口安全配置
+
+### 4.6.1 MAC地址绑定
+
+```text
+#
+# 启用端口安全（限制MAC数量，防私接）
+#
+interface range GigabitEthernet1/0/1 to GigabitEthernet1/0/24
+ port-security enable
+ port-security max-mac-count 2  # 每个端口最多2个MAC
+ port-security intrusion-mode disable  # 违规不关闭端口，仅告警
+ port-security mac-address sticky  # 动态学习并固化
+#
+```
+
+### 4.6.2 802.1X认证（可选）
+
+```text
+#
+# 启用802.1X，对接入用户认证（需RADIUS服务器）
+#
+dot1x enable
+#
+interface range GigabitEthernet1/0/1 to GigabitEthernet1/0/24
+ dot1x port-method  # 端口级认证
+ dot1x port-control auto  # 自动授权
+#
+# RADIUS服务器配置（需提前部署）
+#
+radius-server group rad-account
+ radius-server host 10.10.99.200 key simple radiospass
+#
+dot1x authentication-method md5
+#
+```
+
+---
+
+## 4.7 生成树协议（STP）配置
+
+```text
+#
+# 启用RSTP快速收敛
+#
+stp mode rstp
+stp region-configuration
+ region-name RAD-Dept
+ revision-level 1
+ instance 1 vlan 10 20 30 99
+ active region-configuration
+#
+# 核心交换机配置为根桥
+#
+stp root primary  # 在核心交换机上执行
+#
+# 边缘端口（连接终端）
+#
+interface range GigabitEthernet1/0/1 to GigabitEthernet1/0/24
+ stp edged-port enable
+#
+```
+
+---
+
+## 4.8 监控与告警配置
+
+```text
+#
+# 启用端口流量监控
+#
+interface range Ten-GigabitEthernet1/0/1 to Ten-GigabitEthernet1/0/2
+ port traffic-statistic enable
+#
+# 配置Email告警（当端口错误包>阈值）
+#
+interface GigabitEthernet1/0/1
+ port link-error threshold input-error-pkts 1000 output-error-pkts 1000
+ port link-error alarm enable
+#
+# 向网管系统发送syslog
+#
+info-center source IP
+info-center loghost 10.10.99.200 udp-port 514
+info-center trapbuffer-size 1024
+#
+```
+
+---
+
+## 4.9 配置保存与备份
+
+```text
+#
+# 查看配置
+#
+display current-configuration
+display interface brief
+display vlan
+display qos policy interface
+display link-aggregation summary
+#
+# 保存配置
+#
+save force  # 强制保存
+#
+# 配置备份到Tftp服务器
+#
+tftp 10.10.99.200 put VRPcfg.cc RAD-Dept-Switch-01.cfg
+```
+
+---
+
+## 4.10 故障排查命令速查
+
+| 命令 | 用途 |
+|------|------|
+| `display interface Ten-GigabitEthernet1/0/1` | 查看接口状态、流量、错误计数 |
+| `display qos policy interface GigabitEthernet1/0/1` | 查看QoS策略应用情况 |
+| `display vlan` | 查看VLAN配置 |
+| `display mac-address` | 查看MAC地址表 |
+| `display stp brief` | 查看生成树状态 |
+| `ping -c 100 10.10.1.1` | 测试PACS服务器连通性 |
+| `undisplay all` | 关闭分页输出 |
+| `quit` | 退出查看模式 |
+
+---
+
+## 4.11 注意事项
+
+1. **配置前备份**：所有配置更改前先执行 `save` 备份当前配置
+2. **分步实施**：逐台配置，配置完一台并验证后再配置下一台
+3. **变更管理**：所有配置变更需填写工单，经批准后方可执行
+4. **版本记录**：记录每次配置的日期、人员、配置内容摘要
+5. **回滚准备**：准备旧配置回滚命令，确保5分钟内可恢复
+
+---
+
+**编制：** 网络工程师  
+**审核：** 信息科  
+**适用设备：** H3C S6800系列（Comware V7平台）
